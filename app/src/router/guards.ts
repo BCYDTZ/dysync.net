@@ -88,7 +88,15 @@ const MobileRedirectGuard: NavigationGuard = function (to, from, next) {
   }
 };
 const loginGuard: NavigationGuard = function (to, from, next) {
-  if (!http.checkAuthorization() && !/^\/(init|login|home|mobile)?$/.test(to.fullPath)) {
+  const isAuthorized = http.checkAuthorization();
+
+  // Skip the login screen when a cached token is available.
+  if (isAuthorized && (to.path === '/' || to.path === '/login')) {
+    next(isMobile() ? '/mobile' : '/dashboard');
+    return;
+  }
+
+  if (!isAuthorized && !/^\/(init|login|home|mobile)?$/.test(to.path)) {
     console.log(to.fullPath)
     const account = useAccountStore();
     account.setLogged(false);

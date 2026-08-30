@@ -146,7 +146,15 @@ namespace dy.net.job
             // 遍历每个有效的Cookie，执行同步
             foreach (var cookie in cookies)
             {
-                await ProcessSyncUserCookie(cookie, config);
+                await DouyinSyncRequestGate.EnterAsync(cookie.Id, context.CancellationToken);
+                try
+                {
+                    await ProcessSyncUserCookie(cookie, config, context.CancellationToken);
+                }
+                finally
+                {
+                    DouyinSyncRequestGate.Exit(cookie.Id);
+                }
             }
         }
 
@@ -350,8 +358,9 @@ namespace dy.net.job
         /// </summary>
         /// <param name="cookie">用户Cookie</param>
         /// <param name="config">应用配置</param>
+        /// <param name="cancellationToken">任务取消令牌</param>
         /// <returns>一个表示异步操作的任务</returns>
-        protected async Task ProcessSyncUserCookie(DouyinCookie cookie, AppConfig config)
+        protected async Task ProcessSyncUserCookie(DouyinCookie cookie, AppConfig config, CancellationToken cancellationToken)
         {
             try
             {
@@ -365,13 +374,19 @@ namespace dy.net.job
                             var follows = await douyinFollowService.GetSyncFollows(cookie.MyUserId);
                             if (follows != null && follows.Any())
                             {
-                                foreach (var followed in follows)
+                                for (var index = 0; index < follows.Count; index++)
                                 {
+                                    var followed = follows[index];
                                     int syncCount = 0; // 本次同步成功的视频数量
                                     string cursor = "0";
                                     bool hasMore = true;
-                                    (syncCount, cursor, hasMore) = await GetAndSaveViedos(cookie, config, syncCount, cursor, hasMore, followed);
+                                    (syncCount, cursor, hasMore) = await GetAndSaveViedos(cookie, config, syncCount, cursor, hasMore, followed, cancellationToken: cancellationToken);
                                     await HandleSyncCompletion(cookie, syncCount, followed);
+
+                                    if (index < follows.Count - 1)
+                                    {
+                                        await DelayBetweenRequestsAsync(cancellationToken);
+                                    }
                                 }
                             }
                         }
@@ -387,7 +402,7 @@ namespace dy.net.job
                             int syncCount = 0;
                             string cursor = "0";
                             bool hasMore = true;
-                            (syncCount, cursor, hasMore) = await GetAndSaveViedos(cookie, config, syncCount, cursor, hasMore);
+                            (syncCount, cursor, hasMore) = await GetAndSaveViedos(cookie, config, syncCount, cursor, hasMore, cancellationToken: cancellationToken);
                             await HandleSyncCompletion(cookie, syncCount);
                         }
                         else
@@ -405,7 +420,7 @@ namespace dy.net.job
                             int syncCount = 0;
                             string cursor = "0";
                             bool hasMore = true;
-                            (syncCount, cursor, hasMore) = await GetAndSaveViedos(cookie, config, syncCount, cursor, hasMore);
+                            (syncCount, cursor, hasMore) = await GetAndSaveViedos(cookie, config, syncCount, cursor, hasMore, cancellationToken: cancellationToken);
                             await HandleSyncCompletion(cookie, syncCount);
                         }
                         else
@@ -417,7 +432,7 @@ namespace dy.net.job
                     case VideoTypeEnum.dy_mix:
                         if (cookie.DownMix)
                         {
-                            await SyncCustomListVideos(cookie, config);
+                            await SyncCustomListVideos(cookie, config, cancellationToken);
                         }
                         else
                         {
@@ -426,7 +441,7 @@ namespace dy.net.job
                         break;
                     case VideoTypeEnum.dy_series:
                         if (cookie.DownSeries)
-                            await SyncCustomListVideos(cookie, config);
+                            await SyncCustomListVideos(cookie, config, cancellationToken);
                         else
                         {
                             Log.Debug($"[{cookie.UserName}][{VideoType.GetDesc()}]同步未开启");
@@ -434,7 +449,7 @@ namespace dy.net.job
                         break;
                     case VideoTypeEnum.dy_custom_collect:
                         if (cookie.UseCollectFolder)
-                            await SyncCustomListVideos(cookie, config);
+                            await SyncCustomListVideos(cookie, config, cancellationToken);
                         else
                         {
                             Log.Debug($"[{cookie.UserName}][{VideoType.GetDesc()}]同步未开启");
@@ -447,6 +462,10 @@ namespace dy.net.job
 
 
             }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
             catch (Exception ex)
             {
                 Log.Error(ex, $"[{cookie.UserName}][{VideoType.GetDesc()}]同步出错!!!,{ex.StackTrace}");
@@ -457,20 +476,26 @@ namespace dy.net.job
         /// </summary>
         /// <param name="cookie"></param>
         /// <param name="config"></param>
+        /// <param name="cancellationToken"></param>
         /// <returns></returns>
-        private async Task SyncCustomListVideos(DouyinCookie cookie, AppConfig config)
+        private async Task SyncCustomListVideos(DouyinCookie cookie, AppConfig config, CancellationToken cancellationToken)
         {
             var cates = await douyinCollectCateService.GetSyncCates(cookie.Id, VideoType);
             if (cates != null && cates.Any())
             {
-                foreach (var cate in cates)
+                for (var index = 0; index < cates.Count; index++)
                 {
+                    var cate = cates[index];
                     int syncCount = 0; // 本次同步成功的视频数量
                     string cursor = "0";
                     bool hasMore = true;
-                    (syncCount, cursor, hasMore) = await GetAndSaveViedos(cookie, config, syncCount, cursor, hasMore, null, cate);
+                    (syncCount, cursor, hasMore) = await GetAndSaveViedos(cookie, config, syncCount, cursor, hasMore, null, cate, cancellationToken);
                     await HandleSyncCompletion(cookie, syncCount, null, cate);
 
+                    if (index < cates.Count - 1)
+                    {
+                        await DelayBetweenRequestsAsync(cancellationToken);
+                    }
                 }
             }
             else
@@ -479,11 +504,13 @@ namespace dy.net.job
             }
         }
 
-        private async Task<(int syncCount, string cursor, bool hasMore)> GetAndSaveViedos(DouyinCookie cookie, AppConfig config, int syncCount, string cursor, bool hasMore, DouyinFollowed followed = null, DouyinCollectCate cate = null)
+        private async Task<(int syncCount, string cursor, bool hasMore)> GetAndSaveViedos(DouyinCookie cookie, AppConfig config, int syncCount, string cursor, bool hasMore, DouyinFollowed followed = null, DouyinCollectCate cate = null, CancellationToken cancellationToken = default)
         {
             // 循环获取视频数据
             while (hasMore)
             {
+                cancellationToken.ThrowIfCancellationRequested();
+
                 // 获取视频数据
                 var data = await FetchVideoData(cookie, cursor, followed, cate);
                 if (data == null || data.AwemeList == null || !data.AwemeList.Any())
@@ -498,13 +525,11 @@ namespace dy.net.job
                     cookie.StatusMsg = "正常";
                     await douyinCookieService.UpdateAsync(cookie);
                 }
-                // 判断是否还有更多数据
-                //hasMore = ShouldContinueSync(cookie, data, followed, config);
-
                 // 获取下一页游标
                 cursor = GetNextCursor(data);
 
-                hasMore = data.HasMore == 1;
+                // 默认只获取关注博主的最新一页，只有显式开启 FullSync 才继续翻页。
+                hasMore = ShouldContinueSync(data, followed, config);
 
                 // 处理视频列表
                 (List<DouyinVideo> videos, int syncCountx) = await ProcessVideoList(syncCount, cookie, data, config, followed, cate);
@@ -521,11 +546,38 @@ namespace dy.net.job
                 {
                     break;
                 }
-                //随机等待
-                await Task.Delay(_random.Next(2, 10) * 1000);
+                if (hasMore)
+                {
+                    await DelayBetweenRequestsAsync(cancellationToken, 2, 9);
+                }
             }
 
             return (syncCount, cursor, hasMore);
+        }
+
+        private bool ShouldContinueSync(DouyinVideoInfoResponse data, DouyinFollowed followed, AppConfig config)
+        {
+            if (data?.HasMore != 1)
+            {
+                return false;
+            }
+
+            if (VideoType == VideoTypeEnum.dy_follows)
+            {
+                return followed?.FullSync == true;
+            }
+
+            if (VideoType == VideoTypeEnum.dy_collects || VideoType == VideoTypeEnum.dy_favorite)
+            {
+                return !config.OnlySyncNew;
+            }
+
+            return true;
+        }
+
+        private Task DelayBetweenRequestsAsync(CancellationToken cancellationToken, int minSeconds = 1, int maxSeconds = 3)
+        {
+            return Task.Delay(TimeSpan.FromSeconds(_random.Next(minSeconds, maxSeconds + 1)), cancellationToken);
         }
 
 
@@ -592,6 +644,26 @@ namespace dy.net.job
         {
             int syncCount = 0;
             var videos = new List<DouyinVideo>();
+            var awemeIds = data.AwemeList
+                .Select(x => x.AwemeId)
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Distinct()
+                .ToList();
+            var authorIds = data.AwemeList
+                .Select(x => x.AuthorUserId.ToString())
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Distinct()
+                .ToList();
+
+            // 每页批量预取，避免在 HDD 上为每条视频发起多次 SQLite 随机查询。
+            var deletedAwemeIds = await douyinCommonService.GetDeletedVideoIds(awemeIds);
+            var existingVideos = (await douyinVideoService.GetByAwemeIds(awemeIds))
+                .GroupBy(x => x.AwemeId)
+                .ToDictionary(x => x.Key, x => x.First());
+            var followedByAuthorId = (await douyinFollowService.GetByUperIds(authorIds, cookie.MyUserId))
+                .GroupBy(x => x.UperId)
+                .ToDictionary(x => x.Key, x => x.First());
+
             foreach (var item in data.AwemeList)
             {
                 //if (item.AwemeId != "7321309610927770930")
@@ -604,17 +676,19 @@ namespace dy.net.job
                 //}
 
                 //判断视频是否是强制删除且不再下载的视频
-                var deleteVideo = await douyinCommonService.ExistDeleteVideo(item.AwemeId);
-                if (deleteVideo)
+                if (deletedAwemeIds.Contains(item.AwemeId))
                 {
                     //Log.Debug($"[{VideoType.GetVideoTypeDesc()}]-视频-{item.AwemeId}-[{item.Desc}]已被标记为强制删除，跳过下载");
                     continue;
                 }
 
                 // 查询数据库中是否已存在该视频（通过 AwemeId 唯一标识）
-                var exitVideo = await douyinVideoService.GetByAwemeId(item.AwemeId);
+                existingVideos.TryGetValue(item.AwemeId, out var exitVideo);
+                var existingFileExists = exitVideo != null
+                    && !string.IsNullOrWhiteSpace(exitVideo.VideoSavePath)
+                    && File.Exists(exitVideo.VideoSavePath);
 
-                bool Goon = await AutoDistinct(config, exitVideo, cookie);
+                bool Goon = AutoDistinct(config, exitVideo, cookie, existingFileExists);
                 if (!Goon)
                 {
                     continue;
@@ -623,7 +697,7 @@ namespace dy.net.job
                 if (exitVideo != null)
                 {
                     //文件存在
-                    if (File.Exists(exitVideo.VideoSavePath))
+                    if (existingFileExists)
                     {
                         //如果当前时正在下载关注列表的视频，但是已经存在合集下载过了，那么跳过
                         if (VideoType == VideoTypeEnum.dy_follows && exitVideo.ViedoType == VideoTypeEnum.dy_mix)
@@ -648,7 +722,7 @@ namespace dy.net.job
                     {
                         //2026-06-16 21:56:40 bug修复 ，之前会一直重复下载这个图片
                         //判断如果文件路径="/" 说明是仅下载图片的记录，不处理，直接跳过也不用删除记录
-                        if(exitVideo.VideoUrl=="/"&& exitVideo.IsMergeVideo == 1)
+                        if (exitVideo.OnlyImgOrOnlyMp3 || (exitVideo.VideoUrl == "/" && exitVideo.IsMergeVideo == 1))
                         {
                             continue;
                         }
@@ -657,13 +731,14 @@ namespace dy.net.job
                     }
                 }
 
-                var uper = await douyinFollowService.GetByUperId(item.AuthorUserId.ToString(), cookie.MyUserId);
+                followedByAuthorId.TryGetValue(item.AuthorUserId.ToString(), out var uper);
+                var itemFollowed = followed;
                 if (uper != null && uper.FullSync)
                 {
-                    followed ??= uper;
+                    itemFollowed ??= uper;
                 }
                 // 处理单个视频
-                var video = await ProcessSingleVideo(cookie, item, config, followed, cate);
+                var video = await ProcessSingleVideo(cookie, item, config, itemFollowed, cate);
                 if (video != null)
                 {
                     videos.Add(video);
@@ -709,7 +784,7 @@ namespace dy.net.job
                     if (dynamicVideoUrls.Count > 0)
                     {
                         // 处理动态视频
-                        var dynamicVideo = await ProcessDynamicVideo(dynamicVideoUrls, cookie, item, config, followed, cate);
+                        var dynamicVideo = await ProcessDynamicVideo(dynamicVideoUrls, cookie, item, config, itemFollowed, cate);
                         if (dynamicVideo != null)
                         {
                             if (!string.IsNullOrEmpty(dynamicVideo.DynamicVideos))
@@ -774,7 +849,7 @@ namespace dy.net.job
                         // 处理图文视频逻辑
                         if (config.DownImageVideo || config.DownMp3 || config.DownImage)
                         {
-                            var mergevideo = await ProcessImageSetAndMergeToVideo(cookie, item, config, followed, cate);
+                            var mergevideo = await ProcessImageSetAndMergeToVideo(cookie, item, config, itemFollowed, cate);
                             if (mergevideo != null)
                             {
                                 videos.Add(mergevideo);
@@ -791,7 +866,7 @@ namespace dy.net.job
             return (videos, syncCount);
         }
 
-        private async Task<bool> AutoDistinct(AppConfig config, DouyinVideo exitVideo, DouyinCookie cookie)
+        private bool AutoDistinct(AppConfig config, DouyinVideo exitVideo, DouyinCookie cookie, bool existingFileExists)
         {
             // 去重，检查视频是否已存在（按优先级下载）
             if (config.AutoDistinct)
@@ -799,7 +874,7 @@ namespace dy.net.job
                 if (exitVideo != null)
                 {
                     // 2. 已存在视频：先判断本地文件是否存在
-                    if (File.Exists(exitVideo.VideoSavePath))
+                    if (existingFileExists)
                     {
                         List<PriorityLevelDto> priLevs = new List<PriorityLevelDto>();
                         if (!string.IsNullOrWhiteSpace(config.PriorityLevel))
@@ -898,10 +973,7 @@ namespace dy.net.job
                         }
                         else
                         {
-                            //记录存在，但本地文件不存在，则继续下载。
-                            //Log.Debug($"[{VideoType.GetVideoTypeDesc()}]-视频-{exitVideo.AwemeId}记录存在，但本地文件缺失，删除记录，重新下载");
-                            //删除原来的记录
-                            await douyinVideoService.DeleteById(exitVideo.Id);
+                            // 记录的删除由调用方统一处理，避免重复写库。
                         }
                     }
                 }

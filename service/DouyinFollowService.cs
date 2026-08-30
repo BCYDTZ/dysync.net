@@ -118,6 +118,21 @@ namespace dy.net.service
             return await _followRepository.GetBySecUId(uperId, myUid);
         }
 
+        internal async Task<List<DouyinFollowed>> GetByUperIds(IEnumerable<string> uperIds, string myUid)
+        {
+            var ids = uperIds?
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Distinct()
+                .ToList() ?? new List<string>();
+
+            if (!ids.Any() || string.IsNullOrWhiteSpace(myUid))
+            {
+                return new List<DouyinFollowed>();
+            }
+
+            return await _followRepository.GetListAsync(x => x.mySelfId == myUid && ids.Contains(x.UperId));
+        }
+
         /// <summary>
         /// 打开或关闭同步
         /// </summary>

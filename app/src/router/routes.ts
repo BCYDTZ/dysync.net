@@ -195,7 +195,7 @@ const routes: RouteRecordRaw[] = [
   },
   {
     path: '/database-switch',
-    name: '数据库源',
+    name: '源数据库',
     meta: {
       icon: 'DatabaseOutlined',
       view: 'self',

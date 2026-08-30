@@ -135,6 +135,26 @@ namespace dy.net.service
             return count > 0;
         }
 
+        internal async Task<HashSet<string>> GetDeletedVideoIds(IEnumerable<string> videoIds)
+        {
+            var ids = videoIds?
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Distinct()
+                .ToList() ?? new List<string>();
+
+            if (!ids.Any())
+            {
+                return new HashSet<string>();
+            }
+
+            var deletedIds = await sqlSugarClient.Queryable<DouyinVideoDelete>()
+                .Where(x => ids.Contains(x.ViedoId))
+                .Select(x => x.ViedoId)
+                .ToListAsync();
+
+            return deletedIds.ToHashSet();
+        }
+
         /// <summary>
         /// 新增要删除的视频
         /// </summary>

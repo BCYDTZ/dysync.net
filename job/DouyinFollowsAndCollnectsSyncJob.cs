@@ -24,6 +24,9 @@ namespace dy.net.job
         private const string LOG_TAG_MIX = "合集列表";
         private const string LOG_TAG_SERIES = "短剧列表";
         private const string LOG_TAG_FOLLOW = "关注列表";
+        private const int MIN_REQUEST_DELAY_SECONDS = 1;
+        private const int MAX_REQUEST_DELAY_SECONDS = 3;
+        private readonly Random _random = new();
 
         // 构造函数注入
         public DouyinFollowsAndCollnectsSyncJob(
@@ -53,12 +56,19 @@ namespace dy.net.job
 
             foreach (var ck in cookies)
             {
-                //同步关注列表
-                await SyncFollowListAsync(ck, conf);
-
-                if (ck.UseCollectFolder)
+                await DouyinSyncRequestGate.EnterAsync(ck.Id, context.CancellationToken);
+                try
                 {
-                    await SyncCollectGenericAsync(ck, VideoTypeEnum.dy_custom_collect,
+                    //同步关注列表
+                    await SyncFollowListAsync(ck, conf, context.CancellationToken);
+                    if (ck.UseCollectFolder || ck.DownMix || ck.DownSeries)
+                    {
+                        await DelayBetweenRequestsAsync(context.CancellationToken);
+                    }
+
+                    if (ck.UseCollectFolder)
+                    {
+                        await SyncCollectGenericAsync(ck, VideoTypeEnum.dy_custom_collect,
                         (cookie, offset) => _douyinService.SyncCollectFolderList(cookie.Cookies, offset),
                         item => new DouyinCollectCate
                         {
@@ -72,12 +82,18 @@ namespace dy.net.job
                         data => data?.HasMore ?? false,
                         data => data?.Cursor.ToString() ?? "0",
                         data => data?.CollectsList,
-                        LOG_TAG_COLLECT);
-                }
+                        LOG_TAG_COLLECT,
+                            context.CancellationToken);
 
-                if (ck.DownMix)
-                {
-                    await SyncCollectGenericAsync(ck, VideoTypeEnum.dy_mix,
+                        if (ck.DownMix || ck.DownSeries)
+                        {
+                            await DelayBetweenRequestsAsync(context.CancellationToken);
+                        }
+                    }
+
+                    if (ck.DownMix)
+                    {
+                        await SyncCollectGenericAsync(ck, VideoTypeEnum.dy_mix,
                         (cookie, offset) => _douyinService.SyncMixList(cookie.Cookies, offset),
                         item => new DouyinCollectCate
                         {
@@ -92,12 +108,18 @@ namespace dy.net.job
                         data => (data?.HasMore ?? 0) == 1,
                         data => data?.Cursor.ToString() ?? "0",
                         data => data?.MixInfos,
-                        LOG_TAG_MIX);
-                }
+                        LOG_TAG_MIX,
+                            context.CancellationToken);
 
-                if (ck.DownSeries)
-                {
-                    await SyncCollectGenericAsync(ck, VideoTypeEnum.dy_series,
+                        if (ck.DownSeries)
+                        {
+                            await DelayBetweenRequestsAsync(context.CancellationToken);
+                        }
+                    }
+
+                    if (ck.DownSeries)
+                    {
+                        await SyncCollectGenericAsync(ck, VideoTypeEnum.dy_series,
                         (cookie, offset) => _douyinService.SyncSeriesList(cookie.Cookies, offset),
                         item => new DouyinCollectCate
                         {
@@ -112,10 +134,16 @@ namespace dy.net.job
                         data => (data?.HasMore ?? 0) == 1,
                         data => data?.Cursor.ToString() ?? "0",
                         data => data?.SeriesList,
-                        LOG_TAG_SERIES);
-                }
+                        LOG_TAG_SERIES,
+                            context.CancellationToken);
+                    }
 
-                Log.Debug($"[{ck.UserName}][基础数据]同步完成，包括 [收藏列表、关注列表、合集列表、短剧列表],这不是同步视频！！！ ");
+                    Log.Debug($"[{ck.UserName}][基础数据]同步完成，包括 [收藏列表、关注列表、合集列表、短剧列表],这不是同步视频！！！ ");
+                }
+                finally
+                {
+                    DouyinSyncRequestGate.Exit(ck.Id);
+                }
             }
 
         }
@@ -139,7 +167,8 @@ namespace dy.net.job
             Func<TData, string> getCursorFunc,
             // 列表提取方法
             Func<TData, List<TItem>> getDataListFunc,
-            string logTag)
+            string logTag,
+            CancellationToken cancellationToken)
         {
             var collectDataList = new List<DouyinCollectCate>();
             string offset = "0";
@@ -149,6 +178,8 @@ namespace dy.net.job
             {
                 while (hasMore)
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
+
                     // 1. 获取分页数据（直接调用，调试可断点到具体Service方法）
                     var pageData = await dataFetchFunc(cookie, offset);
                     if (pageData == null) break;
@@ -164,6 +195,11 @@ namespace dy.net.job
                         collectDataList.AddRange(currentItems.Select(entityConvertFunc));
                         Log.Debug($"[{cookie.UserName}][{logTag}]：获取{currentItems.Count}条，累计{collectDataList.Count}条");
                     }
+
+                    if (hasMore)
+                    {
+                        await DelayBetweenRequestsAsync(cancellationToken);
+                    }
                 }
 
                 // 4. 同步到数据库
@@ -177,6 +213,10 @@ namespace dy.net.job
                     Log.Debug($"[{cookie.UserName}][{logTag}]：无有效数据");
                 }
             }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
             catch (Exception ex)
             {
                 Log.Error(ex, $"[{cookie.UserName}][{logTag}]：同步失败");
@@ -185,7 +225,7 @@ namespace dy.net.job
         #endregion
 
         #region 关注列表同步（逻辑独立，无重复）
-        private async Task SyncFollowListAsync(DouyinCookie cookie, AppConfig config)
+        private async Task SyncFollowListAsync(DouyinCookie cookie, AppConfig config, CancellationToken cancellationToken)
         {
             if (string.IsNullOrWhiteSpace(cookie.SecUserId))
             {
@@ -202,6 +242,8 @@ namespace dy.net.job
             {
                 while (hasMore)
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
+
                     var data = await _douyinService.SyncMyFollows(
                         DEFAULT_FOLLOW_COUNT, offset, cookie.SecUserId, cookie.Cookies);
 
@@ -210,16 +252,19 @@ namespace dy.net.job
                         Log.Error($"[{cookie.UserName}] - {LOG_TAG_FOLLOW}同步异常，请检查cookie");
                       break;
                     }
-                    else
-                    {
-                        cookie.StatusCode = data.StatusCode;
-                        cookie.StatusMsg = data.StatusCode == 0 ? "正常" : "异常";
-                        await _dyCookieService.UpdateAsync(cookie);
-                    }
+                    var statusMsg = data.StatusCode == 0 ? "正常" : "异常";
+                    var cookieChanged = cookie.StatusCode != data.StatusCode || cookie.StatusMsg != statusMsg;
+                    cookie.StatusCode = data.StatusCode;
+                    cookie.StatusMsg = statusMsg;
 
-                    if (string.IsNullOrWhiteSpace(cookie.MyUserId))
+                    if (string.IsNullOrWhiteSpace(cookie.MyUserId) && !string.IsNullOrWhiteSpace(data.MySelfUserId))
                     {
                         cookie.MyUserId = data.MySelfUserId;
+                        cookieChanged = true;
+                    }
+
+                    if (cookieChanged)
+                    {
                         await _dyCookieService.UpdateAsync(cookie);
                     }
 
@@ -234,6 +279,11 @@ namespace dy.net.job
                     }
                     //Serilog.Log.Debug("isRestart2=" + config.IsFirstRunning);
                     if (!config.IsFirstRunning) hasMore = false;
+
+                    if (hasMore)
+                    {
+                        await DelayBetweenRequestsAsync(cancellationToken);
+                    }
                 }
 
                 if (followList.Any())
@@ -243,11 +293,21 @@ namespace dy.net.job
                 }
                 await _douyinCommonService.SetConfigNotFirstRunning();
             }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
             catch (Exception ex)
             {
                 Log.Error(ex, $"[{cookie.UserName}][{LOG_TAG_FOLLOW}]：同步失败");
             }
         }
         #endregion
+
+        private Task DelayBetweenRequestsAsync(CancellationToken cancellationToken)
+        {
+            var delay = _random.Next(MIN_REQUEST_DELAY_SECONDS, MAX_REQUEST_DELAY_SECONDS + 1);
+            return Task.Delay(TimeSpan.FromSeconds(delay), cancellationToken);
+        }
     }
 }

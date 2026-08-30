@@ -166,6 +166,21 @@ namespace dy.net.service
             return await _dyCollectVideoRepository.GetFirstAsync(x => x.AwemeId == awemeId);
         }
 
+        internal async Task<List<DouyinVideo>> GetByAwemeIds(IEnumerable<string> awemeIds)
+        {
+            var ids = awemeIds?
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Distinct()
+                .ToList() ?? new List<string>();
+
+            if (!ids.Any())
+            {
+                return new List<DouyinVideo>();
+            }
+
+            return await _dyCollectVideoRepository.GetListAsync(x => ids.Contains(x.AwemeId));
+        }
+
         /// <summary>
         /// 
         /// </summary>
