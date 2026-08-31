@@ -360,7 +360,7 @@ namespace dy.net.Controllers
             var result = await dyCookieService.Switch(dto);
             if (result)
             {
-                ReStartJob();
+                await ReStartJobAsync();
                 return ApiResult.Success();
             }
             return ApiResult.Fail("添加失败");
@@ -386,7 +386,7 @@ namespace dy.net.Controllers
                 var result = await dyCookieService.Add(dyUserCookies);
                 if (result)
                 {
-                    ReStartJob();
+                    await ReStartJobAsync();
                     return ApiResult.Success();
                 }
                 return ApiResult.Fail("添加失败");
@@ -396,7 +396,7 @@ namespace dy.net.Controllers
                 var result = await dyCookieService.UpdateCookieAsync(dyUserCookies);
                 if (result)
                 {
-                    ReStartJob();
+                    await ReStartJobAsync();
                     return ApiResult.Success();
                 }
                 return ApiResult.Fail("更新失败");
@@ -423,7 +423,7 @@ namespace dy.net.Controllers
             var count = await dyCookieService.DeleteByIdsAsync(new List<string> { id });
             if (count > 0)
             {
-                ReStartJob();
+                await ReStartJobAsync();
             }
             return ApiResult.Success(count);
         }
@@ -447,7 +447,7 @@ namespace dy.net.Controllers
                     Serilog.Log.Debug("仅同步新视频配置已生效,后续所有类型的视频同步将只会读取最近一页约20条数据");
                 }
 
-                ReStartJob();
+                await ReStartJobAsync();
             }
             return ApiResult.Success(update);
         }
@@ -467,12 +467,11 @@ namespace dy.net.Controllers
         }
 
 
-        private void ReStartJob()
+        private async Task ReStartJobAsync()
         {
             var config = commonService.GetConfig();
             if (config != null)
-                quartzJobService.InitOrReStartAllJobs(config.Cron.ToString());
-            //避免前端等待
+                await quartzJobService.InitOrReStartAllJobs(config.Cron.ToString());
         }
         /// <summary>
         /// 镜像标签

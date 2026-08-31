@@ -14,6 +14,7 @@ namespace dy.net.service
     {
         private readonly ISchedulerFactory _schedulerFactory;
         private readonly DouyinCookieService douyinCookieService;
+        private static readonly SemaphoreSlim RestartLock = new(1, 1);
         private const string DefaultJobGroup = "dysync.net";
         private const int DefaultIntervalMinutes = 30;
         private const int DefaultCronStartDelaySeconds = 30;
@@ -102,6 +103,14 @@ namespace dy.net.service
         /// <returns>是否成功初始化</returns>
         public async Task<bool> InitOrReStartAllJobs(string cronExpression)
         {
+            // DouyinQuartzJobService 是 Scoped，不同 HTTP 请求会得到不同实例，
+            // 因此必须使用进程级锁才能阻止多个请求同时删除、重建同一批任务。
+            if (!await RestartLock.WaitAsync(0))
+            {
+                Log.Information("【quartz】定时任务正在初始化，忽略本次重复触发");
+                return true;
+            }
+
             try
             {
                 // 1. 获取并验证Cookie
@@ -172,6 +181,10 @@ namespace dy.net.service
             {
                 Log.Error(ex, "【quartz】初始化所有抖音定时任务时发生异常");
                 return false;
+            }
+            finally
+            {
+                RestartLock.Release();
             }
         }
 
