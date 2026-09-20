@@ -45,12 +45,15 @@ namespace dy.net.utils
                     result = sanitizedName.Replace(" ", "");
                 else
                 {
-                    // 4. 超过 255 字节，截取前 255 字节（避免破坏 UTF-8 字符）
-                    byte[] truncatedBytes = new byte[100];
-                    Array.Copy(utf8Bytes, truncatedBytes, 100);
-
-                    // 5. 字节数组转回字符串（自动忽略不完整的尾部字节，避免乱码）
-                    string truncatedName = Encoding.UTF8.GetString(truncatedBytes).TrimEnd('\0').Replace(" ", ""); // 移除可能的空字符
+                    // 4. 超过 100 字节：先回退到完整的 UTF-8 字符边界再截断
+                    //    （定长切字节会把多字节字符拦腰截断，GetString 会产生 U+FFFD 乱码，
+                    //      且 U+FFFD 重新编码占 3 字节，可能回涨超过上限）
+                    int boundary = 100;
+                    while (boundary > 0 && (utf8Bytes[boundary] & 0xC0) == 0x80)
+                    {
+                        boundary--; // 0b10xxxxxx 是续字节，说明 boundary 落在字符中间，回退
+                    }
+                    string truncatedName = Encoding.UTF8.GetString(utf8Bytes, 0, boundary).TrimEnd('\0').Replace(" ", "");
 
                     // 6. 极端情况：截取后为空（如全是非法字符替换后无有效内容），返回默认名
                     result = string.IsNullOrWhiteSpace(truncatedName) ? defaultName : truncatedName;
