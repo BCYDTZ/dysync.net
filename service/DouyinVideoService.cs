@@ -674,8 +674,18 @@ namespace dy.net.service
             // 批量更新数据库
             if (list.Any())
             {
-                await BatchInsertOrUpdate(list);
-                Log.Debug($"批量更新数据库完成，共处理{list.Count}条数据");
+                var updated = await BatchInsertOrUpdate(list);
+                if (updated)
+                {
+                    Log.Debug($"批量更新数据库完成，共处理{list.Count}条数据");
+                }
+                else
+                {
+                    // 事务已回滚：文件已移动而数据库路径未更新，会出现库/盘不一致，
+                    // 必须让失败对调用方可见（#33）
+                    Log.Error($"批量更新数据库失败（事务回滚），共{list.Count}条待更新；常见原因：视频增量统计未初始化");
+                    return false;
+                }
             }
 
             return true;
