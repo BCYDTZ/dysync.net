@@ -3,7 +3,7 @@
     public class VideoTitleDataTemplate
     {
         /// <summary> 对应 {id} </summary>
-        public string Id { get; set; }
+        public string Id { get; set; } = string.Empty;
 
         /// <summary> 对应 {VideoTitle} </summary>
         public string VideoTitle { get; set; } = string.Empty;

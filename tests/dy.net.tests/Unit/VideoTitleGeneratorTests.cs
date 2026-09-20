@@ -51,11 +51,19 @@ public class VideoTitleGeneratorTests
         Assert.Equal("2026-09-20", VideoTitleGenerator.Generate("{ReleaseTime}", data, timeFormat: "yyyy-MM-dd"));
     }
 
-    // 说明：原计划中的 Generate_NullDataIsTreatedAsEmpty 用例未收录——
-    // data 为 null 时 Generate 虽有 data ??= new VideoTitleDataTemplate() 空值保护，
-    // 但 new VideoTitleDataTemplate() 的 Id 为 null，随后 data.Id.ToString() 会抛
-    // NullReferenceException，"null 数据按空数据处理"的预期行为实际不可达（疑似 bug，已另行报告），
-    // 不应把抛异常断言成正确行为。
+    [Fact]
+    public void Generate_NullDataIsTreatedAsEmpty()
+    {
+        // 回归 #31：data 为 null 时兜底对象 Id=null 曾触发 NRE
+        Assert.Equal("无", VideoTitleGenerator.Generate("{Author}", null, emptyPlaceholder: "无"));
+    }
+
+    [Fact]
+    public void Generate_DefaultTemplateIdIsEmptyString()
+    {
+        // 回归 #31：未显式赋值的 Id 不再是 null
+        Assert.Equal("", VideoTitleGenerator.Generate("{Id}", new VideoTitleDataTemplate()));
+    }
 
     [Fact]
     public void Generate_NullTemplateThrows()
