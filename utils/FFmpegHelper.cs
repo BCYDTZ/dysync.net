@@ -1,4 +1,4 @@
-﻿using dy.net.model.dto;
+using dy.net.model.dto;
 using Serilog;
 using System.Diagnostics;
 using System.Globalization;
@@ -6,10 +6,22 @@ using System.Text;
 
 namespace dy.net.utils
 {
+    // ===== 新增：硬件加速类型枚举 =====
+    public enum HardwareAccelerationType
+    {
+        None,
+        Nvenc,
+        Qsv
+    }
+
     public class FFmpegHelper : IDisposable
     {
         private string _ffmpegExecutablePath;
         private string _ffprobeExecutablePath;
+
+        // ===== 新增：硬件加速状态 =====
+        private HardwareAccelerationType _hwAccelType = HardwareAccelerationType.None;
+        public bool UseHardwareAcceleration { get; set; } = true;
 
         public FFmpegHelper()
         {
@@ -18,17 +30,144 @@ namespace dy.net.utils
                 _ffmpegExecutablePath = "/usr/bin/ffmpeg";
                 _ffprobeExecutablePath = "/usr/bin/ffprobe";
             }
-            else
+            else if (OperatingSystem.IsWindows())
             {
+                // ===== 修正：Windows 环境（Debug/Release 都走这里） =====
+                // 之前用 #if DEBUG 判断，导致 Debug 编译的 dll 丢进 Docker 后
+                // 仍然使用 Windows 路径，造成 "No such file or directory"。
+                // 改为直接判断操作系统，无论 Debug/Release、无论部署到哪都不会错。
 #if DEBUG
-                // Debug 环境，通常是 Windows
                 _ffmpegExecutablePath = "E:\\down\\ffmpeg\\bin\\ffmpeg.exe";
                 _ffprobeExecutablePath = "E:\\down\\ffmpeg\\bin\\ffprobe.exe";
 #else
-                // Release 环境，通常是 Docker Linux
-                  _ffmpegExecutablePath = "ffmpeg";
-                  _ffprobeExecutablePath = "ffprobe";
+                _ffmpegExecutablePath = "ffmpeg.exe";
+                _ffprobeExecutablePath = "ffprobe.exe";
 #endif
+            }
+            else
+            {
+                // ===== 修正：Linux / Docker / macOS 环境 =====
+                _ffmpegExecutablePath = "ffmpeg";
+                _ffprobeExecutablePath = "ffprobe";
+            }
+
+            // ===== 新增：构造函数末尾检测硬件加速 =====
+            DetectHardwareAcceleration();
+        }
+
+        // ===== 新增：检测可用的硬件加速编码器（实测版，避免"能列出但用不了"） =====
+        // 优先级：QSV > NVENC > 软件编码
+        private void DetectHardwareAcceleration()
+        {
+            if (!UseHardwareAcceleration)
+            {
+                _hwAccelType = HardwareAccelerationType.None;
+                return;
+            }
+
+            // 优先探测 Intel QSV
+            if (TryEncodeWith("h264_qsv", new[] { "-preset", "medium", "-global_quality", "23" }))
+            {
+                _hwAccelType = HardwareAccelerationType.Qsv;
+                Log.Debug("硬件加速：已启用 h264_qsv");
+                return;
+            }
+
+            // QSV 不可用再尝试 NVIDIA NVENC
+            if (TryEncodeWith("h264_nvenc", new[] { "-preset", "p4", "-rc", "vbr", "-cq", "23", "-b:v", "0" }))
+            {
+                _hwAccelType = HardwareAccelerationType.Nvenc;
+                Log.Debug("硬件加速：已启用 h264_nvenc");
+                return;
+            }
+
+            _hwAccelType = HardwareAccelerationType.None;
+            Log.Debug("硬件加速：未检测到可用编码器，回退到软件编码 libx264");
+        }
+
+        // ===== 新增：真实运行一次 1 秒 256x256 的编码测试 =====
+        private bool TryEncodeWith(string encoder, string[] extraArgs)
+        {
+            try
+            {
+                var args = new List<string>
+                {
+                    "-hide_banner", "-loglevel", "error",
+                    "-f", "lavfi", "-i", "color=red:s=256x256:d=1",
+                    "-c:v", encoder
+                };
+                args.AddRange(extraArgs);
+                args.AddRange(new[] { "-f", "null", "-" });
+
+                var psi = new ProcessStartInfo
+                {
+                    FileName = _ffmpegExecutablePath,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                foreach (var a in args) psi.ArgumentList.Add(a);
+
+                using (var p = Process.Start(psi))
+                {
+                    if (p == null) return false;
+                    string err = p.StandardError.ReadToEnd();
+
+                    // ===== 改动点 A：加 5 秒超时，避免探测卡死导致构造函数永久阻塞 =====
+                    if (!p.WaitForExit(5000))
+                    {
+                        try { p.Kill(entireProcessTree: true); } catch { }
+                        Log.Debug($"硬件编码器 {encoder} 探测超时（5秒）");
+                        return false;
+                    }
+
+                    if (p.ExitCode == 0) return true;
+                    Log.Debug($"硬件编码器 {encoder} 探测失败（退出码 {p.ExitCode}）：{err.Trim()}");
+                    return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Debug($"硬件编码器 {encoder} 探测异常：{ex.Message}");
+                return false;
+            }
+        }
+
+        // ===== 新增：根据硬件加速类型向参数列表追加视频编码参数 =====
+        private void AppendVideoEncoderArgs(List<string> arguments)
+        {
+            switch (_hwAccelType)
+            {
+                case HardwareAccelerationType.Qsv:
+                    arguments.AddRange(new[]
+                    {
+                        "-c:v", "h264_qsv",
+                        "-preset", "medium",
+                        "-global_quality", VideoCrf.ToString(CultureInfo.InvariantCulture)
+                    });
+                    break;
+
+                case HardwareAccelerationType.Nvenc:
+                    arguments.AddRange(new[]
+                    {
+                        "-c:v", "h264_nvenc",
+                        "-preset", "p4",
+                        "-rc", "vbr",
+                        "-cq", VideoCrf.ToString(CultureInfo.InvariantCulture),
+                        "-b:v", "0"
+                    });
+                    break;
+
+                default:
+                    // 未检测到硬件加速，保持原有软件编码参数
+                    arguments.AddRange(new[]
+                    {
+                        "-c:v", VideoCodec,
+                        "-preset", VideoPreset,
+                        "-crf", $"{VideoCrf}"
+                    });
+                    break;
             }
         }
 
@@ -223,6 +362,66 @@ namespace dy.net.utils
         //}
 
 
+        // ===== 改动点 B（路线 3 核心）：新增图片预处理方法 =====
+        /// <summary>
+        /// 图片预处理：等比缩放 + 黑边填充到目标尺寸，输出 jpg。
+        /// 目的：把 scale/pad 从主合成命令里剥离，让 GPU 编码器被喂饱。
+        /// 使用局部 Process 状态，不依赖 _ffmpegProcess，可安全并行调用。
+        /// </summary>
+        private async Task PreprocessImageAsync(
+            string sourcePath,
+            string destPath,
+            int targetWidth,
+            int targetHeight,
+            CancellationToken cancellationToken)
+        {
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = _ffmpegExecutablePath,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                StandardErrorEncoding = Encoding.UTF8
+            };
+
+            var args = new[]
+            {
+                "-y", "-hide_banner", "-loglevel", "error",
+                "-i", sourcePath,
+                "-vf", $"scale={targetWidth}:{targetHeight}:force_original_aspect_ratio=decrease,pad={targetWidth}:{targetHeight}:(ow-iw)/2:(oh-ih)/2:black",
+                "-frames:v", "1",   // 只输出一帧，防止动图/gif 输出多帧
+                "-q:v", "2",        // jpg 质量，2 已接近无损
+                destPath
+            };
+            foreach (var a in args) startInfo.ArgumentList.Add(a);
+
+            using var process = new Process { StartInfo = startInfo };
+            var stderrBuilder = new StringBuilder();
+            process.ErrorDataReceived += (s, e) =>
+            {
+                if (!string.IsNullOrEmpty(e.Data)) stderrBuilder.AppendLine(e.Data);
+            };
+
+            process.Start();
+            process.BeginErrorReadLine();
+
+            using (cancellationToken.Register(() =>
+            {
+                try { if (!process.HasExited) process.Kill(entireProcessTree: true); } catch { }
+            }))
+            {
+                await process.WaitForExitAsync(cancellationToken);
+            }
+
+            if (process.ExitCode != 0)
+            {
+                throw new InvalidOperationException(
+                    $"图片预处理失败：{sourcePath}\nstderr:\n{stderrBuilder}");
+            }
+        }
+
+
         public async Task<string> CreateVideoFromImagesAndAudioAsync(
        IEnumerable<DouyinMergeVideoDto> imageFilePaths,
        string audioFilePath,
@@ -264,16 +463,35 @@ namespace dy.net.utils
             var imageList = imageFilePaths.ToList();
             try
             {
-                for (int i = 0; i < imageList.Count; i++)
-                {
-                    string sourcePath = imageList[i].Path;
-                    string extension = Path.GetExtension(sourcePath);
-                    string destFileName = $"temp_{i + 1:D3}{extension}";
-                    string destPath = Path.Combine(tempImageDir, destFileName);
-                    File.Copy(sourcePath, destPath, true);
-                }
+                // H264编码要求宽高为偶数
+                if (VideoWidth % 2 != 0) VideoWidth++;
+                if (VideoHeight % 2 != 0) VideoHeight++;
 
-                string imageSequencePattern = Path.Combine(tempImageDir, "temp_%03d" + Path.GetExtension(imageList.FirstOrDefault().Path));
+                // ===== 改动点 C（路线 3 核心）：并行预处理所有图片到目标尺寸 jpg =====
+                // 并发度取 CPU 数的一半，上限 8，避免与后续主 FFmpeg 抢 CPU
+                int maxConcurrency = Math.Max(2, Math.Min(Environment.ProcessorCount / 2, 8));
+                using var semaphore = new SemaphoreSlim(maxConcurrency, maxConcurrency);
+
+                var preprocessTasks = imageList.Select(async (img, i) =>
+                {
+                    await semaphore.WaitAsync(cancellationToken);
+                    try
+                    {
+                        string destFileName = $"temp_{i + 1:D3}.jpg";
+                        string destPath = Path.Combine(tempImageDir, destFileName);
+                        await PreprocessImageAsync(img.Path, destPath, VideoWidth, VideoHeight, cancellationToken);
+                        return destPath;
+                    }
+                    finally
+                    {
+                        semaphore.Release();
+                    }
+                }).ToArray();
+
+                string[] preprocessedPaths = await Task.WhenAll(preprocessTasks);
+
+                // 输出统一为 jpg
+                string imageSequencePattern = Path.Combine(tempImageDir, "temp_%03d.jpg");
                 double imageFps = Math.Round(1.0 / ImageDisplayDurationSeconds, 2);
 
                 // 获取音频时长
@@ -317,32 +535,24 @@ namespace dy.net.utils
                     loopCount = (int)Math.Ceiling(audioDurationSeconds / singleLoopDuration);
                 }
 
-                // H264编码要求宽高为偶数
-                if (VideoWidth % 2 != 0) VideoWidth++;
-                if (VideoHeight % 2 != 0) VideoHeight++;
-
-                // ========== 核心优化：图片适配滤镜 ==========
-                // scale=iw*min({VideoWidth}/iw\,{VideoHeight}/ih):ih*min({VideoWidth}/iw\,{VideoHeight}/ih) 等比例缩放
-                // pad={VideoWidth}:{VideoHeight}:(ow-iw)/2:(oh-ih)/2:black 居中填充黑色背景
-                string fitFilter = $"scale=iw*min({VideoWidth}/iw\\,{VideoHeight}/ih):ih*min({VideoWidth}/iw\\,{VideoHeight}/ih),pad={VideoWidth}:{VideoHeight}:(ow-iw)/2:(oh-ih)/2:black";
-
-                // 单图不使用 loop 滤镜。loop 滤镜会缓存解码后的大尺寸帧，
-                // 对高分辨率单图容易造成 FFmpeg 内存占用过高并被容器以 137 退出码杀死。
+                // ===== 改动点 D（路线 3 核心）：滤镜链去掉 scale/pad =====
+                // 图片已预处理为目标尺寸，主合成命令里不再需要 scale/pad
+                // 单图用 null 保持流映射一致；多图只做 loop（复制帧，CPU 开销极小）
                 bool isSingleImage = imageCount == 1;
                 string filterComplex = isSingleImage
-                    ? $"[0:v]{fitFilter}[v]"
-                    : $"[0:v]{fitFilter},loop=loop={loopCount - 1}:size={imageCount}[v]";
+                    ? "[0:v]null[v]"
+                    : $"[0:v]loop=loop={loopCount - 1}:size={imageCount}[v]";
 
                 var arguments = new List<string> { "-y" };
 
                 if (isSingleImage)
                 {
-                    // 由 image2 输入层持续输出同一张静态图，直到音频结束。
+                    // ===== 改动点 E：单图输入改用预处理后的 jpg =====
                     arguments.AddRange(new[]
                     {
                         "-loop", "1",
                         "-framerate", OutputFrameRate.ToString(CultureInfo.InvariantCulture),
-                        "-i", imageList[0].Path
+                        "-i", preprocessedPaths[0]
                     });
                 }
                 else
@@ -357,41 +567,44 @@ namespace dy.net.utils
                 }
 
                 arguments.AddRange(new[]
-            {
-                // 音频输入
-                "-i", audioFilePath,
+                {
+                    // 音频输入
+                    "-i", audioFilePath,
 
-                // 滤镜：尺寸适配 + 循环
-                "-filter_complex", filterComplex,
+                    // 滤镜：尺寸适配 + 循环
+                    "-filter_complex", filterComplex,
 
-                // 流映射
-                "-map", "[v]",
-                "-map", "1:a",
+                    // 流映射
+                    "-map", "[v]",
+                    "-map", "1:a",
+                });
 
-                // 视频编码参数
-                "-c:v", VideoCodec,
-                "-preset", VideoPreset,
-                "-crf", $"{VideoCrf}",
-                "-s", $"{VideoWidth}x{VideoHeight}",
-                "-pix_fmt", "yuv420p",
-                "-profile:v", "main",
+                // ===== 视频编码参数（原 -c:v / -preset / -crf 三行替换为下面这一行，其他不动） =====
+                AppendVideoEncoderArgs(arguments);
 
-                // 音频编码参数
-                "-c:a", AudioCodec,
-                "-b:a", $"{AudioBitrate}",
-                "-ac", "2",
-                "-ar", "44100",
+                arguments.AddRange(new[]
+                {
+                    // ===== 改动点 F：删掉 -s，图片已是目标尺寸 =====
+                    // "-s", $"{VideoWidth}x{VideoHeight}",
+                    "-pix_fmt", "yuv420p",
+                    "-profile:v", "main",
 
-                // 封装优化
-                "-f", "mp4",
-                "-movflags", "+faststart",
+                    // 音频编码参数
+                    "-c:a", AudioCodec,
+                    "-b:a", $"{AudioBitrate}",
+                    "-ac", "2",
+                    "-ar", "44100",
 
-                // 同步参数
-                "-shortest",
+                    // 封装优化
+                    "-f", "mp4",
+                    "-movflags", "+faststart",
 
-                // 输出路径
-                outputVideoPath
-            });
+                    // 同步参数
+                    "-shortest",
+
+                    // 输出路径
+                    outputVideoPath
+                });
 
                 // 执行FFmpeg命令
                 await ExecuteFFmpegAsync(arguments, progress, cancellationToken);
@@ -464,30 +677,34 @@ namespace dy.net.utils
 
             // 4. 构建FFmpeg参数（无需对滤镜做任何转义，保留原有编码配置）
             var arguments = new List<string>
-    {
-        "-y",
-        "-hide_banner",
-        "-loglevel", "error",
-        "-i", videoDto.Path,
-        "-vf", // 滤镜参数标识（独立参数）
-        videoFilter, // 动态滤镜字符串（独立参数，ArgumentList自动处理逗号）
-        "-c:v", VideoCodec,
-        "-preset", VideoPreset,
-        "-crf", $"{VideoCrf}",
-        "-pix_fmt", "yuv420p",
-        "-profile:v", "main",
-        // 关键帧计算也适配动态目标宽，保留原有逻辑
-        "-g", $"{(targetWidth < 1080 ? 60 : 120)}",
-        "-sc_threshold", "0",
-        "-c:a", AudioCodec,
-        "-b:a", AudioBitrate,
-        "-ac", "2",
-        "-ar", "44100",
-        "-strict", "-2",
-        "-f", "mp4",
-        "-movflags", "+faststart",
-        tempVideoPath
-    };
+            {
+                "-y",
+                "-hide_banner",
+                "-loglevel", "error",
+                "-i", videoDto.Path,
+                "-vf", // 滤镜参数标识（独立参数）
+                videoFilter, // 动态滤镜字符串（独立参数，ArgumentList自动处理逗号）
+            };
+
+            // ===== 视频编码参数（原 -c:v / -preset / -crf 三行替换为下面这一行，其他不动） =====
+            AppendVideoEncoderArgs(arguments);
+
+            arguments.AddRange(new[]
+            {
+                "-pix_fmt", "yuv420p",
+                "-profile:v", "main",
+                // 关键帧计算也适配动态目标宽，保留原有逻辑
+                "-g", $"{(targetWidth < 1080 ? 60 : 120)}",
+                "-sc_threshold", "0",
+                "-c:a", AudioCodec,
+                "-b:a", AudioBitrate,
+                "-ac", "2",
+                "-ar", "44100",
+                "-strict", "-2",
+                "-f", "mp4",
+                "-movflags", "+faststart",
+                tempVideoPath
+            });
 
             try
             {
@@ -673,10 +890,12 @@ namespace dy.net.utils
 
                 arguments.AddRange(new[] { "-vf", videoFilter });
 
+                // ===== 视频编码参数（原 -c:v / -preset / -crf 三行替换为下面这一行，其他不动） =====
+                AppendVideoEncoderArgs(arguments);
+
                 // 后续编码参数、执行逻辑均不变（使用基准分辨率）
                 arguments.AddRange(new[]
                 {
-            "-c:v", VideoCodec, "-preset", VideoPreset, "-crf", $"{VideoCrf}",
             "-pix_fmt", "yuv420p", "-profile:v", "main"
         });
 
@@ -756,9 +975,13 @@ namespace dy.net.utils
             }
             _ffmpegProcess = new Process { StartInfo = startInfo };
 
+            // ===== 新增：收集 stderr，便于报错时定位真实原因 =====
+            var stderrBuilder = new System.Text.StringBuilder();
+
             _ffmpegProcess.ErrorDataReceived += (sender, e) =>
             {
                 if (string.IsNullOrEmpty(e.Data)) return;
+                stderrBuilder.AppendLine(e.Data);   // ← 新增
                 //Console.WriteLine($"FFmpeg: {e.Data}");
             };
 
@@ -785,7 +1008,10 @@ namespace dy.net.utils
 
                 if (_ffmpegProcess.ExitCode != 0)
                 {
-                    throw new InvalidOperationException($"FFmpeg执行失败，退出码: {_ffmpegProcess.ExitCode}。请查看控制台输出获取详细错误信息。执行命令：ffmpeg {string.Join(" ", arguments)}");
+                    throw new InvalidOperationException(
+                        $"FFmpeg执行失败，退出码: {_ffmpegProcess.ExitCode}。\n" +
+                        $"stderr:\n{stderrBuilder}\n" +   // ← 新增
+                        $"执行命令：ffmpeg {string.Join(" ", arguments)}");
                 }
             }
             finally
