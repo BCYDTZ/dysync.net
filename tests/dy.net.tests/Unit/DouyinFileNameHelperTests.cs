@@ -1,3 +1,4 @@
+using System.Text;
 using dy.net.utils;
 using Xunit;
 
@@ -68,6 +69,18 @@ public class DouyinFileNameHelperTests
         var input = new string('中', 20) + new string('a', 40) + "DDD";
         var result = DouyinFileNameHelper.SanitizeLinuxFileName(input, "dft");
         Assert.Equal(new string('中', 20) + new string('a', 40), result);
+    }
+
+    [Fact]
+    public void SanitizeLinuxFileName_TruncationNeverBreaksUtf8Character()
+    {
+        // 回归 #32：102 字节输入（33 个完整中文 + 1 个悬挂字节）截断后不得出现 U+FFFD，
+        // 且重新编码不得超过 100 字节
+        var input = new string('中', 34); // 34 × 3 = 102 字节
+        var result = DouyinFileNameHelper.SanitizeLinuxFileName(input, "dft");
+        Assert.Equal(new string('中', 33), result);
+        Assert.Equal(99, Encoding.UTF8.GetByteCount(result));
+        Assert.DoesNotContain('�', result);
     }
 
     [Fact]
