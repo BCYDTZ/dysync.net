@@ -515,7 +515,7 @@ namespace dy.net.job
                 var data = await FetchVideoData(cookie, cursor, followed, cate);
                 if (data == null || data.AwemeList == null || !data.AwemeList.Any())
                 {
-                    Serilog.Log.Debug($"[{cookie.UserName}][{VideoType.GetDesc()}][{cate?.Name}] 没有新的视频");
+                    Serilog.Log.Debug($"[{cookie.UserName}][{VideoType.GetDesc()}]-[{followed?.UperName ?? cate?.Name}] 没有新的视频");
                     break;
                 }
 
